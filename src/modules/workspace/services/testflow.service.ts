@@ -37,35 +37,180 @@ import {
 import {
   RunConfigurationDto,
   Testflow,
+  TestflowEdges,
+  TestflowNodes,
   TestflowSchedular,
 } from "@src/modules/common/models/testflow.model";
-import { WorkspaceDtoForIdDocument } from "../payloads/workspace.payload";
 import { DecodedUserObject } from "@src/types/fastify";
 import { v4 as uuidv4 } from "uuid";
 import { TestflowSchedulerService } from "./testflow-schedular.service";
 import {
   DailyConfig,
+  EmailData,
   HourlyConfig,
+  NotificationReceiveType,
   OnceConfig,
   RunCycleConfig,
   RunCycleEnum,
   WeeklyConfig,
 } from "@src/modules/common/enum/testflow.enum";
-import { EnvironmentRepository } from "../repositories/environment.repository";
+import { TestflowRunService } from "./testflow-run.service";
+import { EmailService } from "@src/modules/common/services/email.service";
+import { ConfigService } from "@nestjs/config";
+import { Logger } from "@nestjs/common";
+import { OnModuleInit } from "@nestjs/common";
+import { UserRepository } from "@src/modules/identity/repositories/user.repository";
 
 /**
  * Testflow Service
  */
 @Injectable()
-export class TestflowService {
+export class TestflowService implements OnModuleInit {
+  private readonly logger = new Logger(TestflowService.name);
   constructor(
     private readonly testflowRepository: TestflowRepository,
     private readonly workspaceReposistory: WorkspaceRepository,
     private readonly producerService: ProducerService,
     private readonly workspaceService: WorkspaceService,
     private readonly testflowSchedulerService: TestflowSchedulerService,
-    private readonly environmentReposistory: EnvironmentRepository,
+    private readonly testflowRunService: TestflowRunService,
+    private readonly emailService: EmailService,
+    private readonly configService: ConfigService,
+    private readonly userReposistory: UserRepository,
   ) {}
+
+  async onModuleInit() {
+    this.logger.log("Bootstrapping schedulers from DB...");
+    const testflows = await this.testflowRepository.getAll();
+    for (const tf of testflows) {
+      if (!tf.schedules?.length) continue;
+      for (const schedule of tf.schedules) {
+        const runCycleConfig = this.buildRunCycleConfig(
+          schedule.runConfiguration,
+        );
+        if (schedule.isActive && schedule.cronExpression) {
+          await this.testflowSchedulerService.addSchedulerJob(
+            runCycleConfig,
+            this.getScheduledExecutionCallback(
+              tf._id.toString(),
+              schedule.environmentId,
+              tf.workspaceId,
+              schedule.id,
+            ),
+            schedule.schedularName,
+            schedule.cronExpression,
+            schedule.id,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+     * Update a specific schedule for a testflow.
+     */
+    async updateTestflowSchedule(
+      testflowId: string,
+      scheduleId: string,
+      updateScheduleDto: Partial<TestflowSchedular>,
+      workspaceId: string,
+      user: DecodedUserObject,
+    ) {
+      // Permission check
+      await this.isWorkspaceAdminorEditor(workspaceId, user._id);
+      // Fetch existing schedule
+      const existingSchedular = await this.testflowRepository.getSchedularById(testflowId, scheduleId);
+      if (!existingSchedular) {
+        throw new NotFoundException('Schedule not found');
+      }
+      // Merge update fields, ensure id is present
+      const updatedSchedular: TestflowSchedular = {
+        ...existingSchedular,
+        ...updateScheduleDto,
+        id: existingSchedular.id,
+        updatedAt: new Date(),
+        updatedBy: user._id.toString(),
+      };
+      // Update schedule in DB
+      const result = await this.testflowRepository.updateSchedular(
+        testflowId,
+        scheduleId,
+        updatedSchedular,
+      );
+      // Optionally update cron job if runConfiguration or isActive changed
+      if (updateScheduleDto.runConfiguration || updateScheduleDto.isActive !== undefined) {
+        const schedular = await this.testflowRepository.getSchedularById(testflowId, scheduleId);
+        if (schedular) {
+          // Remove old job
+          await this.testflowSchedulerService.removeSchedulerJob(scheduleId);
+          // If still active, re-add job
+          if (schedular.isActive) {
+            const runCycleConfig = this.buildRunCycleConfig(schedular.runConfiguration);
+            const cronExpression = schedular.cronExpression || this.generateCronExpression(runCycleConfig);
+            await this.testflowSchedulerService.addSchedulerJob(
+              runCycleConfig,
+              this.getScheduledExecutionCallback(
+                testflowId,
+                schedular.environmentId,
+                workspaceId,
+                scheduleId,
+                user,
+              ),
+              schedular.schedularName,
+              cronExpression,
+              scheduleId,
+            );
+          }
+        }
+      }
+      return result;
+    }
+
+    /**
+     * Delete a specific schedule from a testflow.
+     */
+    async deleteTestflowSchedule(
+      testflowId: string,
+      scheduleId: string,  
+      workspaceId: string,
+      user: DecodedUserObject,
+    ) {
+      await this.isWorkspaceAdminorEditor(workspaceId, user._id);
+      // Remove schedule from DB
+      const result = await this.testflowRepository.removeSchedular(
+        testflowId,
+        scheduleId,
+        user._id,
+      );
+      // Remove cron job
+      await this.testflowSchedulerService.removeSchedulerJob(scheduleId);
+      return result;
+    }
+
+    /**
+     * Manually run a testflow schedule.
+     */
+    async runTestflowSchedule(
+      testflowId: string,
+      scheduleId: string,
+      workspaceId: string,
+      user: DecodedUserObject,
+    ) {
+      await this.isWorkspaceAdminorEditor(workspaceId, user._id);
+      const schedular = await this.testflowRepository.getSchedularById(testflowId, scheduleId);
+      if (!schedular) {
+        throw new NotFoundException('Schedule not found');
+      }
+      // Run the testflow immediately
+      await this.executeTestflow(
+        testflowId,
+        schedular.environmentId,
+        workspaceId,
+        scheduleId,
+        user,
+      );
+      return { success: true, message: 'Schedule run triggered' };
+    }
 
   /**
    * Creates new testflow.
@@ -347,12 +492,13 @@ export class TestflowService {
         schedularData.testflowId,
         newSchedular,
       );
-      // Register cron job
+      //Register cron job
       const jobAdded = await this.testflowSchedulerService.addSchedulerJob(
         runCycleConfig,
         this.getScheduledExecutionCallback(
           schedularData.testflowId,
           schedularData.environmentId,
+          schedularData.workspaceId,
           schedulerId,
           user,
         ),
@@ -375,7 +521,7 @@ export class TestflowService {
     }
   }
 
-  private buildRunCycleConfig(runConfig: RunConfigurationDto): RunCycleConfig {
+  public buildRunCycleConfig(runConfig: RunConfigurationDto): RunCycleConfig {
     switch (runConfig.runCycle) {
       case RunCycleEnum.ONCE:
         if (!runConfig.executeAt) {
@@ -520,16 +666,18 @@ export class TestflowService {
     return `${second} ${minute} ${hour} * * ${days.join(",")}`;
   }
 
-  private getScheduledExecutionCallback(
+  public getScheduledExecutionCallback(
     testflowId: string,
     environmentId: string,
+    workspaceId: string,
     schedulerId: string,
-    user: DecodedUserObject,
+    user?: DecodedUserObject,
   ) {
     return async () => {
       await this.executeTestflow(
         testflowId,
         environmentId,
+        workspaceId,
         schedulerId,
         user,
       );
@@ -540,47 +688,137 @@ export class TestflowService {
   private async executeTestflow(
     testflowId: string,
     environmentId: string,
+    workspaceId: string,
     schedulerId: string,
-    user: DecodedUserObject,
+    user?: DecodedUserObject,
   ) {
     try {
-      const executionResult = {
-        failedRequests: "2",
-        requests: [
-          {
-            method: "POST",
-            name: "CreateUser",
-            status: "Failed",
-            time: new Date().toISOString(),
-          },
-          {
-            method: "GET",
-            name: "FetchUser",
-            status: "Success",
-            time: new Date().toISOString(),
-          },
-        ],
-        status: "completed",
-        successRequests: 5,
-        totalTime: "00:05:30",
-        createdAt: new Date(),
-        updatedAt: new Date(),
-        createdBy: user._id.toString(),
-        updatedBy: user._id.toString(),
+      const response = await this.testflowRunService.handleTestFlowRun(
+        environmentId,
+        workspaceId,
+        testflowId,
+        user,
+      );
+      const scheduleHistory = {
+        id:uuidv4(),
+        nodes: response.nodes,
+        edges: response.edges,
+        ...response.result.history,
       };
       //Save execution result in DB
       await this.testflowRepository.updateSchedularExecution(
         testflowId,
         schedulerId,
-        user._id,
-        executionResult,
+        scheduleHistory,
       );
-      console.log(`Scheduler execution stored for ${schedulerId}`);
+      const getSchedular = await this.testflowRepository.getSchedularById(
+        testflowId,
+        schedulerId,
+      );
+      if (getSchedular.runConfiguration.runCycle === RunCycleEnum.ONCE) {
+        await this.testflowRepository.updateSchedularStatus(
+          testflowId,
+          schedulerId,
+          false,
+        );
+      }
+      const data = response.result.history;
+      let scheduleRunResult;
+      if (data.status === "fail" && data.successRequests < 1) {
+        scheduleRunResult = "failed";
+      } else if (data.status === "success") {
+        scheduleRunResult = "success";
+      } else {
+        scheduleRunResult = "partial";
+      }
+      const totalRequestCount = data.successRequests + data.failedRequests;
+      const userDetails = await this.userReposistory.getUserById(
+        data.createdBy,
+      );
+      const successPercentage =
+        (data.successRequests / totalRequestCount) * 100;
+      const emailData: EmailData = {
+        userName: userDetails?.name,
+        scheduleName: getSchedular.name,
+        scheduleLastestRun: new Date(getSchedular.lastExecuted),
+        scheduleRunResult: scheduleRunResult,
+        scheduleRunPassedCount: data.successRequests,
+        scheduleRunFailedCount: data.failedRequests,
+        scheduleRunTotalRequest: data.successRequests + data.failedRequests,
+        scheduleRunPassPercentage: successPercentage,
+        scheduleTotalTime: data.totalTime,
+        scheduleRunEnvName: response.environmentName,
+        isSuccess: data.successRequests === totalRequestCount,
+        isFailed: data.successRequests === 0,
+        isPartial:
+          data.successRequests > 0 && data.successRequests < totalRequestCount,
+      };
+      if (
+        getSchedular.notification.receiveNotifications ===
+        NotificationReceiveType.FAILURE
+      ) {
+        if (data.status === "fail") {
+          await this.sendNotification(
+            getSchedular.notification.emails,
+            emailData,
+          );
+        }
+      }
+      if (
+        getSchedular.notification.receiveNotifications ===
+        NotificationReceiveType.EVERY_TIME
+      ) {
+        await this.sendNotification(
+          getSchedular.notification.emails,
+          emailData,
+        );
+      }
+      if (getSchedular.runConfiguration.runCycle === RunCycleEnum.ONCE) {
+        await this.testflowRepository.updateSchedularStatus(
+          testflowId,
+          schedulerId,
+          false,
+        );
+      }
     } catch (err) {
       console.error(
         `Error executing testflow for scheduler ${schedulerId}:`,
         err,
       );
     }
+  }
+
+  private async sendNotification(
+    emails: string[],
+    emailData: EmailData,
+  ): Promise<void> {
+    if (!emails || emails.length === 0) {
+      throw new Error(
+        "At least one email address must be provided to send notification.",
+      );
+    }
+    const transporter = this.emailService.createTransporter();
+    // Merge emailData
+    const context = {
+      sparrowEmail: this.configService.get("support.sparrowEmail"),
+      sparrowWebsite: this.configService.get("support.sparrowWebsite"),
+      sparrowWebsiteName: this.configService.get("support.sparrowWebsiteName"),
+      authUrl: this.configService.get("auth.baseURL"),
+      ...emailData,
+    };
+    const promises: Promise<any>[] = [];
+    for (const email of emails) {
+      if (!email?.trim()) continue;
+      const mailOptions = {
+        from: this.configService.get("app.senderEmail"),
+        to: email.trim(),
+        text: "Testflow Run Report",
+        template: "testflowScheduleRunEmail",
+        context,
+        subject: `Sparrow Test Report`,
+      };
+      promises.push(this.emailService.sendEmail(transporter, mailOptions));
+    }
+    await Promise.all(promises);
   }
 }

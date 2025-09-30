@@ -74,8 +74,9 @@ export class TestflowRepository {
    * @returns {Promise<Team>} queried team data
    */
   async getTestflowsByIds(testflowIds: string[]): Promise<WithId<Testflow>[]> {
-    const testflows = await this.db.collection<Testflow>(Collections.TESTFLOW)
-    .find({ _id: { $in: testflowIds.map(id => new ObjectId(id)) } })
+    const testflows = await this.db
+      .collection<Testflow>(Collections.TESTFLOW)
+      .find({ _id: { $in: testflowIds.map((id) => new ObjectId(id)) } })
       .toArray();
     if (!testflows) {
       throw new BadRequestException(
@@ -179,7 +180,6 @@ export class TestflowRepository {
   async updateSchedularExecution(
     testflowId: string,
     schedularId: string,
-    userId: ObjectId,
     runHistoryItem: TestFlowSchedularRunHistory,
   ): Promise<UpdateResult> {
     const now = new Date();
@@ -193,13 +193,13 @@ export class TestflowRepository {
         $set: {
           "schedules.$[elem].lastExecuted": now,
           updatedAt: now,
-          updatedBy: userId?.toString() ?? null,
         },
-        ...(runHistoryItem && {
-          $push: {
-            "schedules.$[elem].schedularRunHistory": runHistoryItem,
+        $push: {
+          "schedules.$[elem].schedularRunHistory": {
+            $each: [runHistoryItem],
+            $position: 0, // newest first
           },
-        }),
+        },
       },
       {
         arrayFilters: [{ "elem.id": schedularId }],
@@ -210,7 +210,6 @@ export class TestflowRepository {
   async updateSchedularStatus(
     testflowId: string,
     schedularId: string,
-    userId: ObjectId,
     isActive = false,
   ): Promise<UpdateResult> {
     const now = new Date();
@@ -223,12 +222,49 @@ export class TestflowRepository {
         $set: {
           "schedules.$[elem].isActive": isActive,
           updatedAt: now,
-          updatedBy: userId?.toString() ?? null,
         },
       },
       {
         arrayFilters: [{ "elem.id": schedularId }],
       },
     );
+  }
+
+  async getSchedularById(
+    testflowId: string,
+    schedularId: string,
+  ): Promise<TestflowSchedular | null> {
+    if (!testflowId || !schedularId) {
+      throw new Error("Both testflowId and schedularId are required");
+    }
+    const result = await this.db.collection(Collections.TESTFLOW).findOne(
+      { _id: new ObjectId(testflowId), "schedules.id": schedularId },
+      {
+        projection: {
+          schedules: {
+            $filter: {
+              input: "$schedules",
+              as: "schedule",
+              cond: { $eq: ["$$schedule.id", schedularId] },
+            },
+          },
+        },
+      },
+    );
+    if (!result || !result.schedules || result.schedules.length === 0) {
+      return null;
+    }
+    return result.schedules[0];
+  }
+
+  async getAll(): Promise<WithId<Testflow>[]> {
+    const data = await this.db
+      .collection<Testflow>(Collections.TESTFLOW)
+      .find({})
+      .toArray();
+    if (!data || data.length === 0) {
+      throw new BadRequestException("No Testflow data found");
+    }
+    return data;
   }
 }
