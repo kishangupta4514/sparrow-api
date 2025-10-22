@@ -1,5 +1,6 @@
 import { Injectable, OnModuleInit, Inject } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
+import { Models } from "@src/modules/common/enum/ai-services.enum";
 import { Collections } from "@src/modules/common/enum/database.collection.enum";
 import { LimitArea } from "@src/modules/common/models/plan.model";
 
@@ -72,6 +73,13 @@ export class CreatePlanMigration implements OnModuleInit {
               area: LimitArea.TESTFLOW_SCHEDULE_RUN,
               value: 3,
             },
+            aiModels: {
+              area: LimitArea.AI_MODELS,
+              value: [
+                { name: Models.DeepSeek, version: "", enable: true },
+                { name: Models.GPT, version: "4o", enable: false },
+              ],
+            },
           },
           createdAt: new Date(),
           updatedAt: new Date(),
@@ -134,6 +142,13 @@ export class CreatePlanMigration implements OnModuleInit {
               area: LimitArea.TESTFLOW_SCHEDULE_RUN,
               value: 10,
             },
+            aiModels: {
+              area: LimitArea.AI_MODELS,
+              value: [
+                { name: Models.DeepSeek, version: "", enable: true },
+                { name: Models.GPT, version: "4o", enable: false },
+              ],
+            },
           },
           createdAt: new Date(),
           updatedAt: new Date(),
@@ -195,6 +210,13 @@ export class CreatePlanMigration implements OnModuleInit {
             testflowScheduleRun: {
               area: LimitArea.TESTFLOW_SCHEDULE_RUN,
               value: 25,
+            },
+            aiModels: {
+              area: LimitArea.AI_MODELS,
+              value: [
+                { name: Models.DeepSeek, version: "", enable: true },
+                { name: Models.GPT, version: "4o", enable: true },
+              ],
             },
           },
           createdAt: new Date(),

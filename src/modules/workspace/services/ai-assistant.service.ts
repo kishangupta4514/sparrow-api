@@ -164,7 +164,7 @@ export class AiAssistantService {
     try {
       if (!this.endpoint || !this.apiKey || !this.apiVersion) {
         console.warn("GPT Client is disabled. Missing configuration values");
-      }else{
+      } else {
         this.gptAssistantsClient = this.getGPTClient();
       }
     } catch (e) {
@@ -181,10 +181,9 @@ export class AiAssistantService {
         console.warn(
           "Deepseek Client is disabled. Missing configuration values",
         );
-      }else{
+      } else {
         this.deepseekClient = this.getDeepSeekClient();
       }
-
     } catch (e) {
       console.error(e);
     }
@@ -1935,7 +1934,10 @@ export class AiAssistantService {
           const model = parsedData.model || "deepseek";
           const conversation = parsedData.conversation || "";
           const activity = parsedData.activity || "chat";
-
+          console.log(
+            "model===============================================================",
+            model,
+          );
           if (model === Models.GPT) {
             await this.handleGptModelInteraction(
               client,
@@ -2492,7 +2494,7 @@ export class AiAssistantService {
             ],
           },
         });
-        
+
       const output = (
         response.body as any
       ).choices?.[0]?.message?.content?.trim();
